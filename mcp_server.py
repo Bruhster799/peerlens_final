@@ -1,0 +1,279 @@
+"""PeerLens MCP server.
+
+Exposes the peer-analysis engine, the live Excel exporter, the macro-sensitivity module and the
+synthetic trading desk as tools any MCP-capable chatbot or agent can call directly — no Streamlit,
+no browser. This is the same `peerlens` package the Streamlit app uses; nothing here is duplicated,
+only wired up differently.
+
+Typical agent flow, start to finish, with no human in the loop after the first ask:
+    list_industries()                                  -> find the right industry
+    list_companies(industry)                           -> find the right companies
+    run_peer_analysis(industry, companies, focal)       -> health scores, weaknesses, strengths
+    export_excel_workbook(industry, companies, focal)   -> a saved .xlsx with the same analysis
+    macro_outlook(industry, companies)                  -> GDP sensitivity (synthetic data only)
+    trading_desk_snapshot(industry, company)            -> the synthetic market + 4 trading bots
+
+Run it:
+    pip install -r requirements.txt
+    python mcp_server.py              # stdio — for Claude Desktop, Claude Code, most local clients
+    python mcp_server.py --http       # streamable HTTP on 127.0.0.1:8000 — for remote / web clients
+
+See README.md for client configuration (Claude Desktop, Claude Code, and any other MCP client).
+"""
+import argparse
+import math
+import os
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+if str(ROOT) not in sys.path:                          # importable regardless of the client's cwd
+    sys.path.insert(0, str(ROOT))
+
+from typing import Literal
+
+import numpy as np
+import pandas as pd
+from mcp.server import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
+
+from peerlens import live, macro, market, synthetic
+from peerlens.excel_export import ExcelDashboard
+from peerlens.pipeline import run_analysis
+from peerlens.universe import load_nifty500
+
+mcp = MCPServer(
+    "PeerLens",
+    instructions=(
+        "Nifty 500 industry peer analysis, a live Excel exporter, a macro-sensitivity module, and a "
+        "synthetic trading desk with four automated strategies — all callable directly, no browser. "
+        "Typical flow: list_industries -> list_companies -> run_peer_analysis -> "
+        "export_excel_workbook. mode='synthetic' (the default everywhere it appears) is instant and "
+        "fully offline; mode='live' fetches real statements from Yahoo Finance and needs internet. "
+        "Company and industry names must match list_industries/list_companies exactly."
+    ),
+)
+
+OUTPUT_DIR = Path(os.environ.get("PEERLENS_EXPORT_DIR", ROOT / "exports")).resolve()
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+_universe_cache: dict = {}
+
+
+# --------------------------------------------------------------------------- helpers
+def _sanitize(obj):
+    """Make any pandas/numpy-flavoured return value safe JSON: NaN/Inf -> None, numpy scalars ->
+    native Python, timestamps -> ISO strings. Applied once, right before every tool returns."""
+    if isinstance(obj, dict):
+        return {k: _sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize(v) for v in obj]
+    if isinstance(obj, np.generic):
+        obj = obj.item()
+    if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
+        return None
+    if isinstance(obj, pd.Timestamp):
+        return obj.isoformat()
+    return obj
+
+
+def _universe():
+    if "data" not in _universe_cache:
+        data, source = load_nifty500()
+        _universe_cache["data"], _universe_cache["source"] = data, source
+    return _universe_cache["data"], _universe_cache["source"]
+
+
+def _members(industry):
+    universe, _ = _universe()
+    members = universe[universe.industry == industry]
+    if members.empty:
+        industries = ", ".join(sorted(universe.industry.unique()))
+        raise ToolError(f"Unknown industry {industry!r}. Call list_industries() for the exact "
+                         f"names. Industries on file: {industries}")
+    return members
+
+
+def _peers_frame(industry, companies):
+    members = _members(industry)
+    chosen = members[members.company.isin(companies)]
+    missing = sorted(set(companies) - set(chosen.company))
+    if missing:
+        available = ", ".join(sorted(members.company))
+        raise ToolError(f"Not found in {industry!r}: {missing}. Call list_companies({industry!r}) "
+                         f"for the exact names. Available: {available}")
+    if len(chosen) < 2:
+        raise ToolError("Need at least 2 companies (focal plus one peer) to run a comparison.")
+    return chosen.reset_index(drop=True)
+
+
+def _fetch(industry, companies, mode, seed, inject_errors=False):
+    peers = _peers_frame(industry, companies)
+    if mode == "synthetic":
+        raw = synthetic.generate_financials(peers, industry, seed, inject_errors)
+        source_label = "Synthetic demo data generated by PeerLens (not reported financials)"
+    else:
+        raw, failed = live.fetch_many_financials(peers)
+        source_label = "Yahoo Finance annual statements via yfinance"
+        if failed:
+            source_label += f" — failed to fetch: {', '.join(failed)}"
+    return peers, raw, source_label
+
+
+# --------------------------------------------------------------------------- tools
+@mcp.tool()
+def list_industries() -> dict:
+    """List every Nifty 500 industry on file and how many constituent companies it has. Always call
+    this first — the other tools need an exact industry name, not a guess."""
+    universe, source = _universe()
+    counts = universe.groupby("industry").size().sort_values(ascending=False)
+    return _sanitize({"source": source,
+                      "industries": [{"industry": i, "companies": int(n)} for i, n in counts.items()]})
+
+
+@mcp.tool()
+def list_companies(industry: str) -> dict:
+    """List the companies and NSE symbols in one Nifty 500 industry, exactly as `run_peer_analysis`,
+    `export_excel_workbook` and `trading_desk_snapshot` expect them."""
+    members = _members(industry)
+    return _sanitize({"industry": industry,
+                      "companies": members[["company", "symbol"]].to_dict("records")})
+
+
+@mcp.tool()
+def run_peer_analysis(industry: str, companies: list[str], focal_company: str,
+                      mode: Literal["synthetic", "live"] = "synthetic", seed: int = 42) -> dict:
+    """Run a full peer ratio analysis: `focal_company` against the other named `companies` in
+    `industry`. Returns the verdict a human analyst would write up — health score and rank, the
+    company's clearest weaknesses (each with the peer-median gap and a recommended action) and its
+    clearest strengths. `mode='synthetic'` (default) is instant and fully offline, good for
+    exploration and coursework; `mode='live'` pulls real Yahoo Finance statements (needs internet,
+    a few seconds per company, occasionally rate-limited) and never invents a missing number."""
+    companies = list(dict.fromkeys([*companies, focal_company]))      # focal always included, no dupes
+    _, raw, source_label = _fetch(industry, companies, mode, seed)
+    result = run_analysis(raw, focal_company, mode=mode)
+    latest = (result.health[result.health.year == result.year]
+             .sort_values("health_score", ascending=False))
+    return _sanitize({
+        "industry": industry, "focal_company": focal_company, "year": result.year,
+        "data_source": source_label, "summary": result.summary_line,
+        "rank": result.rank, "tied_rank": result.tied,
+        "health_scores": [{"company": r.company, "health_score": r.health_score}
+                          for r in latest.itertuples()],
+        "weaknesses": result.recommendations,
+        "strengths": result.strengths,
+        "data_quality": {"issues_before_cleaning": len(result.issues_before),
+                         "issues_after_cleaning": len(result.issues_after),
+                         "auto_fixes_applied": len(result.fixes)},
+    })
+
+
+@mcp.tool()
+def export_excel_workbook(industry: str, companies: list[str], focal_company: str,
+                          mode: Literal["synthetic", "live"] = "synthetic", seed: int = 42) -> dict:
+    """Run the same analysis as `run_peer_analysis` and save it as a live Excel workbook: ratios are
+    formulas on the source data (not hard-coded numbers), the Dashboard sheet has company/year
+    selectors and editable rating thresholds, and synthetic runs also get a macro-sensitivity sheet.
+    Returns the absolute path of the saved file on this machine — the workbook itself is not sent
+    back as chat content, so open the path to view it."""
+    companies = list(dict.fromkeys([*companies, focal_company]))
+    _, raw, source_label = _fetch(industry, companies, mode, seed)
+    result = run_analysis(raw, focal_company, mode=mode)
+
+    macro_tables = None
+    if mode == "synthetic" and result.clean["year"].nunique() >= macro.MIN_YEARS:
+        path = macro.macro_for_years(sorted(result.clean["year"].unique()), seed)
+        sensitivity = macro.gdp_sensitivity(macro.growth_panel(result.clean, path))
+        macro_tables = {"Macro path": path, "GDP sensitivity by company": sensitivity}
+
+    workbook = ExcelDashboard(result.clean, result.ratios, focal_company, result.year, industry,
+                              source_label, result.issues_before, result.fixes,
+                              result.recommendations, result.summary_line,
+                              macro_tables=macro_tables).to_bytes()
+
+    safe = lambda s: s.replace(" ", "_").replace("&", "and").replace("/", "-")
+    file_name = f"PeerLens_{safe(industry)}_{safe(focal_company)}_{result.year}.xlsx"
+    file_path = OUTPUT_DIR / file_name
+    file_path.write_bytes(workbook)
+    return _sanitize({"file_path": str(file_path), "file_name": file_name,
+                      "size_kb": round(len(workbook) / 1024, 1),
+                      "includes_macro_sheet": macro_tables is not None})
+
+
+@mcp.tool()
+def macro_outlook(industry: str, companies: list[str], seed: int = 42) -> dict:
+    """How sensitive this industry's revenue is to the economic cycle: each company's GDP beta (extra
+    revenue-growth percentage points per extra point of real GDP growth), a pooled industry-level
+    estimate with a plain-language headline, and the underlying simulated macro path. Synthetic data
+    only — the macro path is simulated, so there is no `mode='live'` equivalent — and needs at least
+    6 years of history, which the default synthetic run always has."""
+    _, raw, _ = _fetch(industry, companies, "synthetic", seed)
+    result = run_analysis(raw, companies[0], mode="synthetic")
+    if result.clean["year"].nunique() < macro.MIN_YEARS:
+        raise ToolError(f"Need at least {macro.MIN_YEARS} years of data for a macro-sensitivity read; "
+                         f"got {result.clean['year'].nunique()}.")
+    path = macro.macro_for_years(sorted(result.clean["year"].unique()), seed)
+    panel = macro.growth_panel(result.clean, path)
+    sensitivity = macro.gdp_sensitivity(panel)
+    pooled = macro.pooled_sensitivity(panel)
+    return _sanitize({
+        "industry": industry, "headline": macro.headline(industry, pooled),
+        "pooled": pooled, "company_gdp_beta": sensitivity.to_dict("records"),
+        "macro_path": path.to_dict("records"),
+    })
+
+
+@mcp.tool()
+def trading_desk_snapshot(industry: str, company: str, minutes: int = 180, seed: int = 42) -> dict:
+    """Run the synthetic trading-desk simulation for one company and return a snapshot: last traded
+    price against the fundamentals-derived fair value, the spread, and the P&L of all four automated
+    strategies (market maker, momentum, fundamental, and a high-frequency scalper), plus the HFT
+    bot's most recent fills with its running P&L. `minutes` is how far into the trading session to
+    replay (max ~375, a full NSE day). Deterministic and fully offline: the same `seed` and `minutes`
+    always reproduce the identical session."""
+    members = _members(industry)
+    row = members[members.company == company]
+    if row.empty:
+        available = ", ".join(sorted(members.company))
+        raise ToolError(f"{company!r} not found in {industry!r}. Available: {available}")
+    symbol = row.symbol.iloc[0]
+
+    financials = synthetic.generate_financials(members[["company", "symbol"]], industry, seed)
+    analysis = run_analysis(financials, company, mode="synthetic")
+    latest = analysis.health[analysis.health.year == analysis.year].set_index("company")
+    health_score = float(latest["health_score"].get(company, 50.0))
+
+    ticks = max(1, min(int(minutes * 60 / market.TICK_SECONDS), market.TICKS_PER_SESSION))
+    result = market.run_session(symbol, health_score, ticks, pd.Timestamp.now().normalize(), seed)
+    stats = market.microstructure(result)
+    performance = market.performance_table(result)
+    hft_fills = market.agent_tape(result, "HFT bot", last=15)
+
+    return _sanitize({
+        "company": company, "symbol": symbol, "health_score": health_score,
+        "minutes_replayed": round(ticks * market.TICK_SECONDS / 60, 1),
+        "last_price": stats["last"], "fair_value": stats["fair_value"], "spread": stats["spread"],
+        "day_return_pct": None if pd.isna(stats["day_return"]) else round(stats["day_return"] * 100, 2),
+        "volume": stats["volume"],
+        "strategy_performance": performance.to_dict("records"),
+        "hft_bot_recent_fills": hft_fills.to_dict("records"),
+    })
+
+
+# --------------------------------------------------------------------------- entry point
+def main():
+    parser = argparse.ArgumentParser(description="PeerLens MCP server")
+    parser.add_argument("--http", action="store_true",
+                        help="Serve over streamable HTTP instead of stdio — needed for chatbots that "
+                             "connect over a network rather than launching a local process.")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8000)
+    args = parser.parse_args()
+    if args.http:
+        mcp.run(transport="streamable-http", host=args.host, port=args.port)
+    else:
+        mcp.run()
+
+
+if __name__ == "__main__":
+    main()
